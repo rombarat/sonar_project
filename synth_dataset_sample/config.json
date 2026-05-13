@@ -1,0 +1,35 @@
+{
+  "array": {
+    "num_elements": 16,
+    "element_spacing": 0.5,
+    "sound_speed": 1500.0
+  },
+  "scene": {
+    "fs": 16000,
+    "duration_s": 3.0,
+    "p_two_targets": 0.7,
+    "loud_distance_range": [
+      200.0,
+      800.0
+    ],
+    "loud_angle_range_deg": [
+      -60.0,
+      60.0
+    ],
+    "quiet_distance_range": [
+      800.0,
+      3000.0
+    ],
+    "quiet_min_angle_sep_deg": 4.0,
+    "quiet_max_angle_sep_deg": 25.0,
+    "spl_gap_db_range": [
+      15.0,
+      35.0
+    ],
+    "noise_db_below_loud_range": [
+      20.0,
+      40.0
+    ],
+    "steer_jitter_deg": 1.0
+  }
+}

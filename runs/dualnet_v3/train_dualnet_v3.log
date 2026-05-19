@@ -1,0 +1,39 @@
+device : cpu
+samples : 1000  pos=491  neg=509
+train / val : 800 / 200
+params  : 1,553,761
+epoch   1/20 | train loss 0.4106 acc 0.810 | val loss 0.9938 acc 0.455 | lr 1.00e-03 | 212.9s  *best*
+epoch   2/20 | train loss 0.2151 acc 0.914 | val loss 0.8147 acc 0.605 | lr 1.00e-03 | 217.7s  *best*
+epoch   3/20 | train loss 0.1752 acc 0.936 | val loss 0.1466 acc 0.955 | lr 1.00e-03 | 222.1s  *best*
+epoch   4/20 | train loss 0.1314 acc 0.961 | val loss 0.2054 acc 0.930 | lr 1.00e-03 | 219.9s
+epoch   5/20 | train loss 0.1131 acc 0.961 | val loss 0.1383 acc 0.950 | lr 1.00e-03 | 226.7s  *best*
+epoch   6/20 | train loss 0.0898 acc 0.974 | val loss 0.1629 acc 0.960 | lr 1.00e-03 | 230.1s
+epoch   7/20 | train loss 0.0807 acc 0.968 | val loss 0.1733 acc 0.945 | lr 1.00e-03 | 220.0s
+epoch   8/20 | train loss 0.0851 acc 0.974 | val loss 0.1559 acc 0.960 | lr 1.00e-03 | 211.1s
+epoch   9/20 | train loss 0.0982 acc 0.965 | val loss 0.2076 acc 0.940 | lr 5.00e-04 | 274.7s
+epoch  10/20 | train loss 0.0561 acc 0.980 | val loss 0.2213 acc 0.945 | lr 5.00e-04 | 246.5s
+epoch  11/20 | train loss 0.0442 acc 0.989 | val loss 0.3738 acc 0.920 | lr 5.00e-04 | 222.0s
+epoch  12/20 | train loss 0.0345 acc 0.990 | val loss 0.1906 acc 0.965 | lr 5.00e-04 | 244.6s
+epoch  13/20 | train loss 0.0226 acc 0.993 | val loss 0.1686 acc 0.965 | lr 2.50e-04 | 249.5s
+epoch  14/20 | train loss 0.0244 acc 0.994 | val loss 0.2471 acc 0.955 | lr 2.50e-04 | 222.1s
+epoch  15/20 | train loss 0.0159 acc 0.994 | val loss 0.2389 acc 0.955 | lr 2.50e-04 | 182.8s
+epoch  16/20 | train loss 0.0208 acc 0.990 | val loss 0.1954 acc 0.965 | lr 2.50e-04 | 241.6s
+epoch  17/20 | train loss 0.0119 acc 0.998 | val loss 0.2068 acc 0.965 | lr 1.25e-04 | 209.1s
+epoch  18/20 | train loss 0.0244 acc 0.995 | val loss 0.2140 acc 0.960 | lr 1.25e-04 | 171.2s
+epoch  19/20 | train loss 0.0126 acc 0.995 | val loss 0.2439 acc 0.950 | lr 1.25e-04 | 164.9s
+epoch  20/20 | train loss 0.0107 acc 0.996 | val loss 0.2415 acc 0.955 | lr 1.25e-04 | 170.1s
+
+best val loss = 0.1383   checkpoint -> runs\dualnet_v3\best_model.pth
+best ckpt: epoch 5  val_loss=0.138286  val_acc=0.9500
+
+========== Validation report ==========
+  Accuracy  : 0.9500
+  Precision : 0.9681
+  Recall    : 0.9286   <-- critical: detection of quiet vessel
+  F1        : 0.9479
+  Confusion matrix (rows=true, cols=pred):
+              pred-Neg  pred-Pos
+  true-Neg :      99        3
+  true-Pos :       7       91
+
+  saved -> runs\dualnet_v3\confusion_matrix.png

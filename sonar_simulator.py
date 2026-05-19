@@ -30,9 +30,13 @@ Pipeline (per sample)
 3. Calibrate amplitudes from sir_range_db (loudest amplitude = 1.0).
 4. Far-field plane-wave propagation: phase-only per-element steering vector.
 5. Add ambient noise at the configured SNR.
-6. DAS beamform at the quietest target's angle ± steering_error_deg.
-   For 1-target scenes pick a random "ghost" angle near the loud target.
-7. Welch PSD of the beamformed output → save .npz + .wav + .png + CSV row.
+6. Dual-output processing for a dual-input DL model:
+   - 1D Focus  : DAS at the quiet target's angle ± steering_error_deg
+                 (or a "ghost" angle for 1-target scenes) → Welch PSD → psd_1d
+   - 2D Context: DAS at every angle on a uniform sweep (default 1°) →
+                 Welch PSD per angle, stacked → psd_2d  (n_angles, n_freqs)
+7. Save .npz (psd_1d + psd_2d + axes) + .wav (raw central hydrophone, NOT
+   beamformed) + .png (combined 1D-line / 2D-heatmap figure) + CSV row.
 """
 
 from __future__ import annotations
@@ -108,16 +112,14 @@ class SimConfig:
     fs: int = 16000
     duration_s: float = 3.0
 
-    # -------- beam-scan axis (visualisation / PNG only) --------
+    # -------- beam-scan axis (psd_2d "Global Context" + PNG) --------
+    # The sweep below produces BOTH the 2D training tensor saved in the .npz
+    # AND the heatmap in the PNG. Default 1° gives 181 angles end-to-end —
+    # coarser than the ~1.1° beamwidth at broadside but a good cost/quality
+    # tradeoff. Drop to 0.5° if the model is starved of spatial resolution.
     scan_angle_min_deg: float = -90.0
     scan_angle_max_deg: float = 90.0
-    # 0.2° resolves the ~1.1° beamwidth of a 100-el array; safe to increase
-    # to 0.5° for even faster PNG generation at the cost of coarser heatmap.
-    scan_angle_step_deg: float = 0.2
-    # Number of time samples used for the periodogram scan (PNG only).
-    # Larger → better frequency resolution in the heatmap; does NOT affect
-    # the Welch PSD saved in the .npz. Memory ∝ N × scan_n_fft.
-    scan_n_fft: int = 1024
+    scan_angle_step_deg: float = 1.0
 
 
 # =============================================================================
@@ -286,6 +288,27 @@ class SonarSimulator:
             )
         return files
 
+    def _safe_random_clip(self, wav_pool: list[str]) -> np.ndarray:
+        """
+        Pick and load a random clip from the pool, retrying with a different
+        pick (and pruning the broken path) when scipy.io.wavfile chokes on a
+        malformed/exotic WAV (24-bit, truncated, bad headers, ...). Raises
+        only when every remaining path in the pool has failed.
+        """
+        while wav_pool:
+            idx = int(self.rng.integers(0, len(wav_pool)))
+            path = wav_pool[idx]
+            try:
+                return self._load_clip(path)
+            except (ValueError, EOFError, OSError) as e:
+                # Prune and try another. We log to stderr so it surfaces in
+                # the run log without aborting the batch.
+                import sys
+                print(f"[warn] dropping unreadable wav: {path}  ({e})",
+                      file=sys.stderr)
+                wav_pool.pop(idx)
+        raise RuntimeError("WAV pool exhausted — every clip failed to load.")
+
     def _load_clip(self, path: str) -> np.ndarray:
         sr, x = wavfile.read(path)
         if x.dtype.kind == "i":
@@ -365,46 +388,87 @@ class SonarSimulator:
                      detrend=False, scaling="density")
         return f.astype(np.float32), p.astype(np.float32)
 
-    def beam_scan_periodogram(self, mc: np.ndarray,
-                              scan_angles_deg: np.ndarray,
-                              n_fft: int = 1024,
-                              chunk: int = 50,
-                              ) -> tuple[np.ndarray, np.ndarray]:
+    def welch_beam_sweep(self, mc: np.ndarray,
+                         scan_angles_deg: np.ndarray,
+                         ) -> tuple[np.ndarray, np.ndarray]:
         """
-        Fast angle scan → (n_angles, n_freqs) power matrix for PNG heatmaps.
+        Global Context tensor: Welch PSD of the DAS output at every angle on
+        the sweep. Returns (welch_freqs, psd_2d) with psd_2d.shape =
+        (n_angles, n_freqs) — the 2D input for the dual-input DL model.
 
-        Uses a periodogram (squared rFFT magnitude) on the first `n_fft`
-        samples of the multichannel signal.  Memory cost per chunk:
-        (chunk × N × n_fft/2 × 4) bytes — for chunk=50, N=100, n_fft=1024
-        that is only ~10 MB, vs. hundreds of MB for a full Welch scan.
+        Implementation — STFT-once, beamform-in-freq-domain:
+          1. Per-channel windowed segment STFT, computed ONCE  →  segs (N, S, F)
+          2. Per angle: conj-steer (N, F) × segs → mean over elements →
+             segment-power → mean over segments. No IRFFT, no scipy.welch
+             call in the inner loop.
 
-        This is NOT used for the saved .npz training data; the proper Welch
-        PSD at the steer angle is always written to disk separately.
+        Mathematically equivalent to running ``welch_psd(das_beamform(mc, θ))``
+        at every angle (matches scipy.signal.welch with detrend=False and
+        scaling="density" to within float32 round-off), but reuses the
+        per-channel STFT across all 181 angles. ~10× faster than the naive
+        per-angle Welch loop on a 100-element, 3-second sample.
         """
-        n_fft = min(n_fft, mc.shape[1])
-        # Use only the first n_fft samples — enough to show the spatial pattern
-        X = np.fft.rfft(mc[:, :n_fft].astype(np.float32),
-                        axis=1).astype(np.complex64)          # (N, F)
-        F = X.shape[1]
-        freqs = np.fft.rfftfreq(n_fft, 1.0 / self.cfg.fs).astype(np.float32)
+        from scipy.signal import get_window
 
-        x_pos = self.element_positions.astype(np.float32)
-        c     = np.float32(self.cfg.array_params.sound_speed)
-        # base[n,f] = 2π x_n f / c  — precomputed once, shape (N, F)
-        base  = (np.float32(2.0 * math.pi) / c *
-                 np.outer(x_pos, freqs).astype(np.float32))
+        wp        = self.cfg.welch_params
+        fs        = self.cfg.fs
+        nperseg   = int(wp.nperseg)
+        noverlap  = int(wp.noverlap)
+        hop       = nperseg - noverlap
+        n         = mc.shape[1]
+        N         = mc.shape[0]
 
-        sin_all = np.sin(np.deg2rad(scan_angles_deg)).astype(np.float32)
+        if n < nperseg:
+            raise ValueError(f"Signal length {n} < nperseg {nperseg}")
+        n_seg     = (n - nperseg) // hop + 1
+        n_freqs   = nperseg // 2 + 1
 
-        rows: list = []
-        for start in range(0, len(sin_all), chunk):
-            sc    = sin_all[start:start + chunk]               # (k,)
-            phase = sc[:, None, None] * base[None, :, :]       # (k, N, F) float32
-            A_c   = (np.cos(phase) + 1j * np.sin(phase)).astype(np.complex64)
-            Y     = (A_c * X[None, :, :]).mean(axis=1)         # (k, F)
-            rows.append((np.abs(Y) ** 2 / n_fft).real.astype(np.float32))
+        win       = get_window(wp.window, nperseg).astype(np.float32)
+        freqs     = np.fft.rfftfreq(nperseg, 1.0 / fs).astype(np.float32)
+        # scipy.welch density normalization: 1 / (fs * Σ win²)
+        norm      = np.float32(1.0 / (fs * float((win.astype(np.float64) ** 2).sum())))
 
-        return freqs, np.vstack(rows)                          # (n_ang, F)
+        # ----- Step 1: per-channel windowed-segment STFT (done once) -------
+        # Build the (N, S, nperseg) view explicitly with strides to avoid a
+        # Python loop over segments. mc is C-contiguous so each row is
+        # stride 4 bytes (float32); the segment stride is `hop * 4`.
+        mc_f32  = np.ascontiguousarray(mc, dtype=np.float32)
+        stride0, stride1 = mc_f32.strides
+        windowed = np.lib.stride_tricks.as_strided(
+            mc_f32,
+            shape=(N, n_seg, nperseg),
+            strides=(stride0, stride1 * hop, stride1),
+            writeable=False,
+        ) * win                                                # (N, S, nperseg)
+        segs = np.fft.rfft(windowed, axis=-1).astype(np.complex64)  # (N, S, F)
+        del windowed
+
+        # ----- Step 2: per-angle steer + segment power -----
+        x_pos = self.element_positions.astype(np.float32)[:, None]   # (N,1)
+        c_s   = np.float32(self.cfg.array_params.sound_speed)
+        base  = (np.float32(2.0 * math.pi) / c_s) * x_pos * freqs[None, :]  # (N,F)
+
+        n_ang  = len(scan_angles_deg)
+        psd_2d = np.empty((n_ang, n_freqs), dtype=np.float32)
+        inv_N  = np.float32(1.0 / N)
+
+        for i, ang_deg in enumerate(scan_angles_deg):
+            sin_t  = np.float32(math.sin(math.radians(float(ang_deg))))
+            phase  = sin_t * base                                            # (N,F)
+            A_conj = (np.cos(phase) + 1j * np.sin(phase)).astype(np.complex64)
+            # Contract over elements: Y[s,f] = (1/N) Σ_n A_conj[n,f] · segs[n,s,f]
+            Y      = np.einsum('nf,nsf->sf', A_conj, segs) * inv_N          # (S,F)
+            psd_2d[i] = (Y.real * Y.real + Y.imag * Y.imag).mean(axis=0)
+
+        # Density scaling + one-sided correction (×2 except DC and, for even
+        # nperseg, the Nyquist bin) — applied vectorised after the loop.
+        psd_2d *= norm
+        if nperseg % 2 == 0:
+            psd_2d[:, 1:-1] *= 2.0
+        else:
+            psd_2d[:, 1:]   *= 2.0
+
+        return freqs, psd_2d                                                # (n_ang, F)
 
     # ----------------------------- scene sampler -------------------------------
 
@@ -484,7 +548,7 @@ class SonarSimulator:
         # Build superposition at the array
         mc = np.zeros((self.cfg.array_params.num_elements, n_t), dtype=np.float32)
         for theta_deg, sir_db in zip(scene["angles_deg"], scene["sirs_db"]):
-            clip = self._load_clip(self.rng.choice(wav_pool))
+            clip = self._safe_random_clip(wav_pool)
             amp = 10.0 ** (-sir_db / 20.0)      # loud=1.0, quieter<1.0
             mc += self.propagate_source(clip, math.radians(theta_deg), amp)
 
@@ -493,28 +557,34 @@ class SonarSimulator:
         noise_rms = ref_rms * 10.0 ** (-scene["snr_db"] / 20.0)
         mc += self.make_noise(mc.shape, noise_rms)
 
-        # Beamform + Welch at the steer angle
-        y = self.das_beamform(mc, math.radians(scene["steer_angle_deg"]))
-        f_steer, psd_steer = self.welch_psd(y)
+        # --- 1D "Focus" : DAS at the (jittered) quiet target + Welch -------
+        y_focus           = self.das_beamform(
+            mc, math.radians(scene["steer_angle_deg"]))
+        freqs_1d, psd_1d  = self.welch_psd(y_focus)
 
-        # Fast periodogram scan — only used for the PNG heatmap, NOT saved to .npz
+        # --- 2D "Global Context" : Welch PSD swept across all angles -------
         scan_angles = np.arange(self.cfg.scan_angle_min_deg,
                                 self.cfg.scan_angle_max_deg
                                 + self.cfg.scan_angle_step_deg,
                                 self.cfg.scan_angle_step_deg,
                                 dtype=np.float32)
-        f_scan, psd_scan = self.beam_scan_periodogram(
-            mc, scan_angles, n_fft=self.cfg.scan_n_fft)
+        freqs_2d, psd_2d  = self.welch_beam_sweep(mc, scan_angles)
+
+        # Raw central hydrophone (un-steered reference) — what gets written
+        # to disk as the .wav, separate from the 1D Focus beamformer output.
+        ref_idx = self.cfg.array_params.num_elements // 2
+        ref_hydrophone = mc[ref_idx].copy()
 
         return {
-            "scene":         scene,
-            "sample_id":     sample_id,
-            "beamformed":    y,
-            "freqs":         f_steer,
-            "psd_at_steer":  psd_steer,
+            "scene":           scene,
+            "sample_id":       sample_id,
+            "ref_hydrophone":  ref_hydrophone,
+            "beamformed":      y_focus,        # kept for inspection/debug
+            "freqs_1d":        freqs_1d,
+            "psd_1d":          psd_1d,
             "scan_angles_deg": scan_angles,
-            "scan_freqs":    f_scan,
-            "psd_scan":      psd_scan,
+            "freqs_2d":        freqs_2d,
+            "psd_2d":          psd_2d,
         }
 
     # ----------------------------- plotting -----------------------------------
@@ -527,56 +597,67 @@ class SonarSimulator:
 
     def plot_sample(self, sample: dict, fig=None, show: bool = False):
         """
-        Two-panel figure:
-          top    — 1-D Welch PSD at the steer angle (frequency view)
-          bottom — Welch PSD across angles, with vertical dashed lines at
-                   true target bearings (red=loudest, warmer colors for
-                   progressively quieter targets) and a white dotted line
-                   at the steer angle.
+        Dual-input figure for the DL model inputs, side by side:
+
+          left   — 1D Welch PSD at the Focus steer angle (psd_1d)
+          right  — 2D Welch PSD across the angle sweep (psd_2d) as a heatmap
+                   with **Frequency on X** and **Angle on Y**.
+                   Horizontal dashed lines mark true target bearings:
+                       red   = loudest target
+                       green = quiet target(s)
+                   A white dotted line marks the Focus steer angle.
         """
         sc = sample["scene"]
         if fig is None:
-            fig = plt.figure(figsize=(11, 8), layout="constrained")
-        gs = fig.add_gridspec(2, 1, height_ratios=[1.0, 1.8], hspace=0.32)
+            fig = plt.figure(figsize=(14, 6), layout="constrained")
+        gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.6], wspace=0.18)
 
-        # --- top: 1D PSD at steer ---
-        ax_top = fig.add_subplot(gs[0])
-        psd_db = 10.0 * np.log10(sample["psd_at_steer"] + 1e-20)
-        ax_top.plot(sample["freqs"], psd_db, color="navy", linewidth=1.0)
-        ax_top.set_xlabel("Frequency [Hz]")
-        ax_top.set_ylabel("PSD [dB / Hz]")
-        ax_top.set_title(
+        fig.suptitle(
             f"Sample {sample['sample_id']}  —  "
             f"{sc['num_targets']}-target"
             f"{', hard' if sc['hard_case'] else ', easy'}  "
             f"|  steer = {sc['steer_angle_deg']:+.2f}°  "
             f"|  SNR = {sc['snr_db']:.1f} dB  "
-            f"|  noise = {self.cfg.noise_params.noise_type}"
+            f"|  noise = {self.cfg.noise_params.noise_type}",
+            fontsize=11,
         )
-        ax_top.grid(alpha=0.3)
 
-        # --- bottom: angle × frequency heatmap ---
-        ax = fig.add_subplot(gs[1])
+        # ----- Left: 1D Focus PSD ---------------------------------------
+        ax1 = fig.add_subplot(gs[0])
+        psd1_db = 10.0 * np.log10(sample["psd_1d"] + 1e-20)
+        ax1.plot(sample["freqs_1d"], psd1_db, color="navy", linewidth=1.0)
+        ax1.set_xlabel("Frequency [Hz]")
+        ax1.set_ylabel("PSD [dB / Hz]")
+        ax1.set_title(f"1D Focus  —  Welch PSD @ steer "
+                      f"{sc['steer_angle_deg']:+.2f}°")
+        ax1.grid(alpha=0.3)
+
+        # ----- Right: 2D Global Context heatmap (freq-X, angle-Y) -------
+        ax2 = fig.add_subplot(gs[1])
         angles = sample["scan_angles_deg"]
-        freqs = sample["scan_freqs"]
-        psd2d_db = 10.0 * np.log10(sample["psd_scan"] + 1e-20)
-        vmax = float(psd2d_db.max())
-        im = ax.pcolormesh(angles, freqs, psd2d_db.T, shading="auto",
-                           cmap="viridis", vmin=vmax - 60.0, vmax=vmax)
-        ax.set_xlabel("Steering angle [deg]")
-        ax.set_ylabel("Frequency [Hz]")
-        plt.colorbar(im, ax=ax, label="PSD [dB]")
+        freqs  = sample["freqs_2d"]
+        psd2_db = 10.0 * np.log10(sample["psd_2d"] + 1e-20)
+        vmax = float(psd2_db.max())
+        # pcolormesh(X, Y, C) needs C of shape (len(Y), len(X)) — psd_2d is
+        # already (n_angles, n_freqs) so it can be passed in directly.
+        im = ax2.pcolormesh(freqs, angles, psd2_db, shading="auto",
+                            cmap="viridis", vmin=vmax - 60.0, vmax=vmax)
+        ax2.set_xlabel("Frequency [Hz]")
+        ax2.set_ylabel("Steering angle [deg]")
+        ax2.set_title("2D Global Context  —  Welch PSD over angle sweep")
+        plt.colorbar(im, ax=ax2, label="PSD [dB]")
 
-        # Target vertical lines
+        # Horizontal target lines: red=loud, green=quiet target(s)
         for rank, (theta, sir) in enumerate(zip(sc["angles_deg"], sc["sirs_db"])):
-            label = (f"target #{rank} @ {theta:+.1f}°  "
-                     + ("(loudest)" if rank == 0 else f"(SIR={sir:.1f} dB)"))
-            ax.axvline(theta, color=self._target_color(rank),
-                       linestyle="--", linewidth=2.0, label=label)
-        ax.axvline(sc["steer_angle_deg"], color="white", linestyle=":",
-                   linewidth=1.5,
-                   label=f"steer @ {sc['steer_angle_deg']:+.2f}°")
-        ax.legend(loc="upper right", fontsize=8, framealpha=0.85)
+            color = "red" if rank == 0 else "limegreen"
+            label = (f"loud @ {theta:+.1f}°" if rank == 0
+                     else f"quiet @ {theta:+.1f}° (SIR={sir:.1f} dB)")
+            ax2.axhline(theta, color=color, linestyle="--",
+                        linewidth=2.0, label=label)
+        ax2.axhline(sc["steer_angle_deg"], color="white", linestyle=":",
+                    linewidth=1.5,
+                    label=f"steer @ {sc['steer_angle_deg']:+.2f}°")
+        ax2.legend(loc="upper right", fontsize=8, framealpha=0.85)
 
         if show:
             plt.show()
@@ -585,7 +666,18 @@ class SonarSimulator:
     # ----------------------------- batch loop ----------------------------------
 
     def run_batch(self, n_samples: int, wav_dir: str | Path,
-                  out_dir: str | Path, progress: bool = True) -> Path:
+                  out_dir: str | Path, progress: bool = True,
+                  n_qa_plots: Optional[int] = None) -> Path:
+        """
+        Generate `n_samples` and write `.npz`/`.wav` for every one of them.
+
+        ``n_qa_plots`` controls the PNG output:
+          None        — render a PNG for every sample (default; QA-heavy)
+          int N >= 0  — render PNGs only for the first N samples; later rows
+                        get an empty ``plot_path`` in labels.csv. PNG render
+                        is a sizeable share of per-sample wall time, so cap
+                        it for large training runs.
+        """
         wav_pool = self._list_wavs(wav_dir)
         out_dir = Path(out_dir)
         (out_dir / "psd").mkdir(parents=True, exist_ok=True)
@@ -615,26 +707,33 @@ class SonarSimulator:
                 ex = self.generate_one(wav_pool, sample_id=i)
                 stem = f"sample_{i:06d}"
 
-                # ---- npz ----
+                # ---- npz : dual-input tensors for the DL model ----
+                # psd_1d : (n_freqs,)            — 1D Focus
+                # psd_2d : (n_angles, n_freqs)   — 2D Global Context
+                # freqs_1d / freqs_2d / scan_angles_deg are axes for both.
                 psd_path = out_dir / "psd" / f"{stem}.npz"
                 np.savez_compressed(
                     psd_path,
-                    freqs=ex["freqs"],
-                    psd_at_steer=ex["psd_at_steer"],
+                    psd_1d=ex["psd_1d"],
+                    psd_2d=ex["psd_2d"],
+                    freqs_1d=ex["freqs_1d"],
+                    freqs_2d=ex["freqs_2d"],
                     scan_angles_deg=ex["scan_angles_deg"],
-                    scan_freqs=ex["scan_freqs"],
-                    psd_scan=ex["psd_scan"],
                 )
 
-                # ---- wav ----
+                # ---- wav : raw central un-steered hydrophone ----
                 wav_path = out_dir / "wav" / f"{stem}.wav"
-                self._save_wav(wav_path, ex["beamformed"])
+                self._save_wav(wav_path, ex["ref_hydrophone"])
 
-                # ---- png ----
-                plot_path = out_dir / "plots" / f"{stem}.png"
-                fig = self.plot_sample(ex)
-                fig.savefig(plot_path, dpi=120)
-                plt.close(fig)
+                # ---- png (QA only — skipped past n_qa_plots) ----
+                if n_qa_plots is None or i < n_qa_plots:
+                    plot_path = out_dir / "plots" / f"{stem}.png"
+                    fig = self.plot_sample(ex)
+                    fig.savefig(plot_path, dpi=120)
+                    plt.close(fig)
+                    plot_rel = str(plot_path.relative_to(out_dir))
+                else:
+                    plot_rel = ""
 
                 # ---- csv row ----
                 sc = ex["scene"]
@@ -647,7 +746,7 @@ class SonarSimulator:
                     "noise_type": self.cfg.noise_params.noise_type,
                     "psd_path":  str(psd_path.relative_to(out_dir)),
                     "wav_path":  str(wav_path.relative_to(out_dir)),
-                    "plot_path": str(plot_path.relative_to(out_dir)),
+                    "plot_path": plot_rel,
                 }
                 for k in range(max_tg):
                     if k < sc["num_targets"]:
@@ -704,16 +803,26 @@ if __name__ == "__main__":
             design_freq_hz = 1500.0,
         ),
         target_counts = (1, 2),         # 1-target (negative) or 2-target (positive)
-        sir_range_db  = (0.0, 25.0),    # up to 25 dB covers sidelobe-10-dB scenario
-        p_hard_case   = 0.70,           # 70% of 2-target scenes: tight placement
+        # ---------------------------------------------------------------
+        # SIR / SNR set to counter the +20 dB array gain of N=100.
+        # With SIR=35 dB and SNR=−5 dB at the element level, the quiet
+        # target sits at  (−5 − 35) + 20 = −20 dB SNR at the DAS output —
+        # firmly below the noise floor, where neither human nor model can
+        # cheat. With SIR=15 dB and SNR=+15 dB the same math gives the
+        # quiet target at +20 dB output SNR (clearly detectable). So this
+        # range straddles the actual physical decision boundary instead
+        # of sitting comfortably above it.
+        # ---------------------------------------------------------------
+        sir_range_db  = (15.0, 35.0),
+        p_hard_case   = 0.80,           # 80% of 2-target scenes: tight placement
         hard_case_min_sep_deg = 0.1,    # quiet target ≥ 0.1° from loud
-        hard_case_max_sep_deg = 3.0,    # quiet target ≤ 3° from loud (in lobes)
-        easy_min_sep_deg = 20.0,        # easy 30%: targets well separated
+        hard_case_max_sep_deg = 1.5,    # quiet target ≤ 1.5° from loud (main lobe + 1st sidelobe)
+        easy_min_sep_deg = 20.0,        # easy 20%: targets well separated
         easy_max_sep_deg = 60.0,
         min_inter_target_sep_deg = 0.1,
         noise_params  = NoiseParams(
             noise_type    = "WGN",      # switch to "pink" or "brown" anytime
-            snr_range_db  = (20.0, 40.0),
+            snr_range_db  = (-5.0, 15.0),  # negative floor: quiet buried at element level
         ),
         welch_params  = WelchParams(
             window   = "hann",
@@ -723,8 +832,7 @@ if __name__ == "__main__":
         steering_error_deg = 0.5,
         fs                 = 16000,
         duration_s         = 3.0,
-        scan_angle_step_deg = 0.2,   # 0.2° resolves the ~1.1° beamwidth of N=100
-        scan_n_fft          = 1024,  # periodogram FFT size for PNG heatmap
+        scan_angle_step_deg = 1.0,   # 181-angle Welch sweep for psd_2d + PNG
     )
     # =========================================================================
     # >>>   END USER-EDITABLE PARAMETERS   <<<

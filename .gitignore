@@ -4,6 +4,15 @@
 data/
 Dataset/
 synth_dataset/
+synth_dataset_1k/
+synth_dataset_v2/
+synth_dataset_v3/
+
+# Office lock files
+~$*
+
+# Unpacked PPTX temp directory
+poster/unpacked/
 
 # Common audio / array dump formats
 *.wav
